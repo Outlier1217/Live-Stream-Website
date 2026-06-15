@@ -1,0 +1,40 @@
+datasource db {
+  provider = "postgresql"
+}
+
+generator client {
+  provider = "prisma-client-js"
+  output   = "../app/generated/prisma"
+}
+
+model Playlist {
+  id        String   @id @default(uuid())
+  name      String
+  videos    Video[]
+  createdAt DateTime @default(now())
+}
+
+model Video {
+  id          String   @id @default(uuid())
+  title       String
+  description String?
+  tags        String[]
+  thumbnail   String?
+  filePath    String
+  order       Int      @default(0)
+  playlist    Playlist @relation(fields: [playlistId], references: [id])
+  playlistId  String
+  createdAt   DateTime @default(now())
+}
+
+model StreamConfig {
+  id           String   @id @default(uuid())
+  playlistId   String   @unique
+  streamKey    String
+  title        String
+  description  String?
+  tags         String[]
+  monetization Boolean  @default(false)
+  status       String   @default("OFFLINE")
+  pid          Int?
+}
