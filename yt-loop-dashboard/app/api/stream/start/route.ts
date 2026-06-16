@@ -12,44 +12,37 @@ export async function POST(req: NextRequest) {
   });
 
   if (!videos.length) {
-    return NextResponse.json({ error: "No videos" }, { status: 400 });
+    return NextResponse.json({ error: "No videos in playlist" }, { status: 400 });
   }
 
-  // Create concat file
   const concatPath = `/tmp/${playlistId}-concat.txt`;
   const concatContent = videos
-    .map((v) => `file '${v.filePath}'`)
+    .map((v: { filePath: string }) => `file '${v.filePath}'`)
     .join("\n");
   await writeFile(concatPath, concatContent);
 
   const rtmpUrl = `rtmp://a.rtmp.youtube.com/live2/${streamKey}`;
 
-  // Spawn FFmpeg loop
   const ffmpeg = spawn("ffmpeg", [
-    "-re",
-    "-stream_loop", "-1",
-    "-f", "concat",
-    "-safe", "0",
+    "-re", "-stream_loop", "-1",
+    "-f", "concat", "-safe", "0",
     "-i", concatPath,
-    "-c:v", "libx264",
-    "-preset", "veryfast",
-    "-b:v", "3000k",
-    "-maxrate", "3000k",
-    "-bufsize", "6000k",
-    "-pix_fmt", "yuv420p",
-    "-g", "60",
-    "-c:a", "aac",
-    "-b:a", "160k",
-    "-ar", "44100",
-    "-f", "flv",
-    rtmpUrl,
-  ], { detached: true });
+    "-c:v", "libx264", "-preset", "veryfast",
+    "-b:v", "3000k", "-maxrate", "3000k", "-bufsize", "6000k",
+    "-pix_fmt", "yuv420p", "-g", "60",
+    "-c:a", "aac", "-b:a", "160k", "-ar", "44100",
+    "-f", "flv", rtmpUrl,
+  ], { detached: true, stdio: "ignore" });
 
-  ffmpeg.stderr.on("data", (d) => console.log(d.toString()));
+  ffmpeg.unref();
 
-  await prisma.streamConfig.update({
+  await prisma.streamConfig.upsert({
     where: { playlistId },
-    data: { status: "LIVE", pid: ffmpeg.pid },
+    update: { status: "LIVE", pid: ffmpeg.pid },
+    create: {
+      playlistId, streamKey, title: "", tags: [],
+      status: "LIVE", pid: ffmpeg.pid,
+    },
   });
 
   return NextResponse.json({ status: "started", pid: ffmpeg.pid });
