@@ -24,14 +24,16 @@ export async function POST(req: NextRequest) {
   const rtmpUrl = `rtmp://a.rtmp.youtube.com/live2/${streamKey}`;
 
   const ffmpeg = spawn("ffmpeg", [
-    "-re", "-stream_loop", "-1",
-    "-f", "concat", "-safe", "0",
+    "-re",
+    "-stream_loop", "-1",
+    "-f", "concat",
+    "-safe", "0",
     "-i", concatPath,
-    "-c:v", "libx264", "-preset", "veryfast",
-    "-b:v", "3000k", "-maxrate", "3000k", "-bufsize", "6000k",
-    "-pix_fmt", "yuv420p", "-g", "60",
-    "-c:a", "aac", "-b:a", "160k", "-ar", "44100",
-    "-f", "flv", rtmpUrl,
+    "-c:v", "copy",
+    "-c:a", "copy",
+    "-f", "flv",
+    "-flvflags", "no_duration_filesize",
+    rtmpUrl,
   ], { detached: true, stdio: "ignore" });
 
   ffmpeg.unref();
