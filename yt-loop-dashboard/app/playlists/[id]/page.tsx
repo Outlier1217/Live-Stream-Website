@@ -2,6 +2,23 @@
 import { useEffect, useState, useRef } from "react";
 import { useParams } from "next/navigation";
 import Sidebar from "@/app/components/Sidebar";
+import {
+  DndContext,
+  closestCenter,
+  KeyboardSensor,
+  PointerSensor,
+  useSensor,
+  useSensors,
+  DragEndEvent,
+} from "@dnd-kit/core";
+import {
+  arrayMove,
+  SortableContext,
+  sortableKeyboardCoordinates,
+  useSortable,
+  verticalListSortingStrategy,
+} from "@dnd-kit/sortable";
+import { CSS } from "@dnd-kit/utilities";
 
 interface Video {
   id: string;
@@ -14,13 +31,94 @@ interface Video {
 }
 
 interface StreamConfig {
-  id?: string;
   streamKey: string;
   title: string;
   description: string;
   tags: string;
   monetization: boolean;
   status: string;
+}
+
+// Sortable Video Item
+function SortableVideoItem({
+  video,
+  index,
+  onDelete,
+}: {
+  video: Video;
+  index: number;
+  onDelete: (id: string) => void;
+}) {
+  const { attributes, listeners, setNodeRef, transform, transition, isDragging } =
+    useSortable({ id: video.id });
+
+  const style = {
+    transform: CSS.Transform.toString(transform),
+    transition,
+    opacity: isDragging ? 0.5 : 1,
+    zIndex: isDragging ? 999 : "auto",
+  };
+
+  return (
+    <div
+      ref={setNodeRef}
+      style={{ ...style, background: "var(--card)", border: `1px solid ${isDragging ? "var(--accent)" : "var(--border)"}`, borderRadius: "12px" }}
+      className="flex items-center gap-3 p-3"
+    >
+      {/* Drag Handle */}
+      <div
+        {...attributes}
+        {...listeners}
+        className="flex flex-col gap-0.5 cursor-grab active:cursor-grabbing flex-shrink-0 px-1 py-2"
+        style={{ color: "var(--muted)" }}
+      >
+        <div className="w-4 h-0.5 rounded" style={{ background: "var(--muted)" }} />
+        <div className="w-4 h-0.5 rounded" style={{ background: "var(--muted)" }} />
+        <div className="w-4 h-0.5 rounded" style={{ background: "var(--muted)" }} />
+      </div>
+
+      {/* Index */}
+      <div
+        className="w-7 h-7 rounded-lg flex items-center justify-center text-xs font-bold flex-shrink-0"
+        style={{ background: "var(--bg)", color: "var(--muted)" }}
+      >
+        {index + 1}
+      </div>
+
+      {/* Thumbnail */}
+      {video.thumbnail ? (
+        <img src={video.thumbnail} alt={video.title}
+          className="w-16 h-10 object-cover rounded-lg flex-shrink-0" />
+      ) : (
+        <div className="w-16 h-10 rounded-lg flex items-center justify-center flex-shrink-0"
+          style={{ background: "var(--bg)", fontSize: "20px" }}>🎬</div>
+      )}
+
+      {/* Info */}
+      <div className="flex-1 min-w-0">
+        <p className="font-medium text-sm truncate">{video.title}</p>
+        {video.tags.length > 0 && (
+          <div className="flex gap-1 mt-0.5 flex-wrap">
+            {video.tags.slice(0, 3).map((tag) => (
+              <span key={tag} className="text-xs px-1.5 py-0.5 rounded"
+                style={{ background: "var(--bg)", color: "var(--muted)" }}>
+                #{tag}
+              </span>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* Delete */}
+      <button
+        onClick={() => onDelete(video.id)}
+        className="text-sm px-3 py-1.5 rounded-lg transition-opacity hover:opacity-80 flex-shrink-0"
+        style={{ background: "#2a1a1a", color: "#ff6b6b" }}
+      >
+        🗑 Delete
+      </button>
+    </div>
+  );
 }
 
 export default function PlaylistPage() {
@@ -34,8 +132,8 @@ export default function PlaylistPage() {
   const [uploadProgress, setUploadProgress] = useState(0);
   const [streaming, setStreaming] = useState(false);
   const [activeTab, setActiveTab] = useState<"videos" | "stream">("videos");
+  const [saving, setSaving] = useState(false);
 
-  // Upload form state
   const [videoFile, setVideoFile] = useState<File | null>(null);
   const [thumbFile, setThumbFile] = useState<File | null>(null);
   const [videoTitle, setVideoTitle] = useState("");
@@ -44,11 +142,16 @@ export default function PlaylistPage() {
   const fileRef = useRef<HTMLInputElement>(null);
   const thumbRef = useRef<HTMLInputElement>(null);
 
+  const sensors = useSensors(
+    useSensor(PointerSensor),
+    useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates })
+  );
+
   const fetchData = async () => {
     const res = await fetch(`/api/playlists/${id}`);
     const data = await res.json();
     setPlaylistName(data.name);
-    setVideos(data.videos || []);
+    setVideos((data.videos || []).sort((a: Video, b: Video) => a.order - b.order));
   };
 
   const fetchConfig = async () => {
@@ -73,6 +176,29 @@ export default function PlaylistPage() {
     if (id) { fetchData(); fetchConfig(); }
   }, [id]);
 
+  const handleDragEnd = async (event: DragEndEvent) => {
+    const { active, over } = event;
+    if (!over || active.id === over.id) return;
+
+    const oldIndex = videos.findIndex((v) => v.id === active.id);
+    const newIndex = videos.findIndex((v) => v.id === over.id);
+    const reordered = arrayMove(videos, oldIndex, newIndex);
+    setVideos(reordered);
+
+    // Save new order to DB
+    setSaving(true);
+    await Promise.all(
+      reordered.map((v, i) =>
+        fetch(`/api/videos/${v.id}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ order: i }),
+        })
+      )
+    );
+    setSaving(false);
+  };
+
   const uploadVideo = async () => {
     if (!videoFile || !videoTitle.trim()) return alert("Video file and title required");
     setUploading(true);
@@ -86,7 +212,7 @@ export default function PlaylistPage() {
     formData.append("description", videoDesc);
     formData.append("tags", videoTags);
 
-    setUploadProgress(30);
+    setUploadProgress(40);
     const res = await fetch("/api/videos/upload", { method: "POST", body: formData });
     setUploadProgress(90);
 
@@ -120,7 +246,6 @@ export default function PlaylistPage() {
         monetization: config.monetization,
       }),
     });
-    alert("Stream config saved!");
   };
 
   const goLive = async () => {
@@ -162,8 +287,12 @@ export default function PlaylistPage() {
             <h1 className="text-2xl font-bold">{playlistName}</h1>
             <p className="text-sm" style={{ color: "var(--muted)" }}>{videos.length} videos</p>
           </div>
-          {/* Live Status + Button */}
           <div className="flex items-center gap-3">
+            {saving && (
+              <span className="text-xs px-2 py-1 rounded" style={{ color: "var(--muted)", background: "var(--card)" }}>
+                Saving order...
+              </span>
+            )}
             <div className={`flex items-center gap-2 px-3 py-1 rounded-full text-sm font-medium ${
               streaming ? "bg-red-900 text-red-300" : "bg-gray-800 text-gray-400"
             }`}>
@@ -258,50 +387,31 @@ export default function PlaylistPage() {
               </button>
             </div>
 
-            {/* Video List */}
-            <div className="space-y-2">
-              {videos.length === 0 && (
-                <div className="text-center py-12 rounded-xl"
-                  style={{ background: "var(--card)", border: "1px solid var(--border)" }}>
-                  <p className="text-4xl mb-2">🎬</p>
-                  <p style={{ color: "var(--muted)" }}>No videos yet. Upload one above!</p>
-                </div>
-              )}
-              {videos.map((v, i) => (
-                <div key={v.id} className="flex items-center gap-3 p-3 rounded-xl"
-                  style={{ background: "var(--card)", border: "1px solid var(--border)" }}>
-                  <div className="w-8 h-8 rounded-lg flex items-center justify-center text-sm font-bold flex-shrink-0"
-                    style={{ background: "var(--bg)", color: "var(--muted)" }}>
-                    {i + 1}
+            {/* Drag hint */}
+            {videos.length > 1 && (
+              <p className="text-xs mb-3" style={{ color: "var(--muted)" }}>
+                ☰ Drag videos to reorder — order saves automatically
+              </p>
+            )}
+
+            {/* Sortable Video List */}
+            {videos.length === 0 ? (
+              <div className="text-center py-12 rounded-xl"
+                style={{ background: "var(--card)", border: "1px solid var(--border)" }}>
+                <p className="text-4xl mb-2">🎬</p>
+                <p style={{ color: "var(--muted)" }}>No videos yet. Upload one above!</p>
+              </div>
+            ) : (
+              <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
+                <SortableContext items={videos.map((v) => v.id)} strategy={verticalListSortingStrategy}>
+                  <div className="space-y-2">
+                    {videos.map((v, i) => (
+                      <SortableVideoItem key={v.id} video={v} index={i} onDelete={deleteVideo} />
+                    ))}
                   </div>
-                  {v.thumbnail ? (
-                    <img src={v.thumbnail} alt={v.title}
-                      className="w-16 h-10 object-cover rounded-lg flex-shrink-0" />
-                  ) : (
-                    <div className="w-16 h-10 rounded-lg flex items-center justify-center flex-shrink-0"
-                      style={{ background: "var(--bg)" }}>🎬</div>
-                  )}
-                  <div className="flex-1 min-w-0">
-                    <p className="font-medium text-sm truncate">{v.title}</p>
-                    {v.tags.length > 0 && (
-                      <div className="flex gap-1 mt-0.5 flex-wrap">
-                        {v.tags.slice(0, 3).map((tag) => (
-                          <span key={tag} className="text-xs px-1.5 py-0.5 rounded"
-                            style={{ background: "var(--bg)", color: "var(--muted)" }}>
-                            #{tag}
-                          </span>
-                        ))}
-                      </div>
-                    )}
-                  </div>
-                  <button onClick={() => deleteVideo(v.id)}
-                    className="text-sm px-3 py-1.5 rounded-lg transition-opacity hover:opacity-80 flex-shrink-0"
-                    style={{ background: "#2a1a1a", color: "#ff6b6b" }}>
-                    🗑 Delete
-                  </button>
-                </div>
-              ))}
-            </div>
+                </SortableContext>
+              </DndContext>
+            )}
           </div>
         )}
 
@@ -312,9 +422,7 @@ export default function PlaylistPage() {
             <h2 className="font-semibold mb-4">Stream Configuration</h2>
             <div className="space-y-4">
               <div>
-                <label className="text-xs mb-1 block" style={{ color: "var(--muted)" }}>
-                  🔑 YouTube Stream Key *
-                </label>
+                <label className="text-xs mb-1 block" style={{ color: "var(--muted)" }}>🔑 YouTube Stream Key *</label>
                 <input type="password" value={config.streamKey}
                   onChange={(e) => setConfig((c) => ({ ...c, streamKey: e.target.value }))}
                   placeholder="xxxx-xxxx-xxxx-xxxx-xxxx" style={inputStyle} />
@@ -342,9 +450,7 @@ export default function PlaylistPage() {
                 style={{ background: "var(--bg)", border: "1px solid var(--border)" }}>
                 <div>
                   <p className="text-sm font-medium">Monetization</p>
-                  <p className="text-xs" style={{ color: "var(--muted)" }}>
-                    Enable ads on this stream
-                  </p>
+                  <p className="text-xs" style={{ color: "var(--muted)" }}>Enable ads on this stream</p>
                 </div>
                 <button onClick={() => setConfig((c) => ({ ...c, monetization: !c.monetization }))}
                   className="relative w-12 h-6 rounded-full transition-colors duration-200"
