@@ -29,8 +29,16 @@ export async function POST(req: NextRequest) {
     "-f", "concat",
     "-safe", "0",
     "-i", concatPath,
-    "-c:v", "copy",
-    "-c:a", "copy",
+    "-c:v", "libx264",       // re-encode for seamless loop
+    "-preset", "ultrafast",  // minimum CPU usage
+    "-crf", "23",
+    "-pix_fmt", "yuv420p",
+    "-g", "60",
+    "-sc_threshold", "0",
+    "-c:a", "aac",
+    "-b:a", "160k",
+    "-ar", "44100",
+    "-ac", "2",
     "-f", "flv",
     "-flvflags", "no_duration_filesize",
     rtmpUrl,
