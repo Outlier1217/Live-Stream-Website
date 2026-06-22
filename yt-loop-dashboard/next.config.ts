@@ -5,9 +5,7 @@ const nextConfig: NextConfig = {
     serverActions: {
       bodySizeLimit: "1000mb",
     },
-    // Yeh Middleware ki 10MB limit ko hatayega
-    middlewareClientMaxBodySize: "1000mb",
-    // Naye proxy convention ke liye bhi limit add kar di hai
+    // Ab sirf naya wala proxyClientMaxBodySize hi use karenge
     proxyClientMaxBodySize: "1000mb", 
   },
 };
