@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
-import { writeFile, mkdir } from "fs/promises";
+import { mkdir } from "fs/promises";
+import { createWriteStream } from "fs"; // <-- Yeh naya import add kiya hai
 import path from "path";
 import prisma from "@/lib/prisma";
 
@@ -27,15 +28,30 @@ export async function POST(req: NextRequest) {
 
   const filename = `${Date.now()}-${file.name.replace(/\s+/g, "_")}`;
   const filepath = path.join(VIDEOS_DIR, filename);
-  const buffer = Buffer.from(await file.arrayBuffer());
-  await writeFile(filepath, buffer);
+  
+  // 🟢 NAYA CODE: Stream use karke memory bachana (For 500MB+ files)
+  const writeStream = createWriteStream(filepath);
+  const reader = file.stream().getReader();
+  
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) {
+      writeStream.end();
+      break;
+    }
+    writeStream.write(Buffer.from(value));
+  }
 
+  // Thumbnail chhoti hoti hai (1-2 MB), toh usme pehle wala tareeqa chal jayega
   let thumbnailPath: string | null = null;
   if (thumbnail) {
     const thumbFilename = `${Date.now()}-${thumbnail.name.replace(/\s+/g, "_")}`;
     thumbnailPath = path.join(THUMBS_DIR, thumbFilename);
-    const thumbBuffer = Buffer.from(await thumbnail.arrayBuffer());
-    await writeFile(thumbnailPath, thumbBuffer);
+    const thumbArrayBuffer = await thumbnail.arrayBuffer();
+    
+    const thumbWriteStream = createWriteStream(thumbnailPath);
+    thumbWriteStream.write(Buffer.from(thumbArrayBuffer));
+    thumbWriteStream.end();
   }
 
   const lastVideo = await prisma.video.findFirst({
