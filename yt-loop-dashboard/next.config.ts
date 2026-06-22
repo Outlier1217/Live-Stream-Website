@@ -3,8 +3,12 @@ import type { NextConfig } from "next";
 const nextConfig: NextConfig = {
   experimental: {
     serverActions: {
-      bodySizeLimit: "500mb", // Yahan 500MB set kiya hai, apni jarurat ke hisaab se change kar lena
+      bodySizeLimit: "1000mb",
     },
+    // Yeh Middleware ki 10MB limit ko hatayega
+    middlewareClientMaxBodySize: "1000mb",
+    // Naye proxy convention ke liye bhi limit add kar di hai
+    proxyClientMaxBodySize: "1000mb", 
   },
 };
 
