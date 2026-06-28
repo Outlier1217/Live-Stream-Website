@@ -7,7 +7,6 @@ import prisma from "@/lib/prisma";
 
 const LOG_DIR = "/var/log/yt-streams";
 
-// ✅ Global Map — Next.js restarts ke baad bhi PID track rehta hai
 declare global {
   var _streamProcesses: Map<string, ChildProcess> | undefined;
 }
@@ -18,7 +17,6 @@ async function ensureLogDir() {
   await mkdir(LOG_DIR, { recursive: true });
 }
 
-// ✅ Concat file — 999 loops = effective infinite
 async function writeConcatFile(concatPath: string, filePaths: string[]) {
   const REPEAT = 999;
   const lines: string[] = [];
@@ -39,10 +37,10 @@ function startFFmpeg(
   const ffmpeg = spawn(
     "ffmpeg",
     [
-      "-re",
+      // ✅ -re REMOVED — VFR videos ke saath hang karta tha
+      "-fflags", "+genpts+igndts",
       "-f", "concat",
       "-safe", "0",
-      // ✅ NO -stream_loop here — concat file itself has 999 repetitions
       "-i", concatPath,
 
       // Video
@@ -50,12 +48,11 @@ function startFFmpeg(
       "-preset", "ultrafast",
       "-crf", "23",
       "-pix_fmt", "yuv420p",
+      "-vsync", "cfr",        // ✅ Variable framerate fix
+      "-r", "30",             // ✅ Force constant 30fps — hang fix
       "-g", "60",
       "-keyint_min", "60",
       "-sc_threshold", "0",
-
-      // ✅ KEY FIX: Timestamp regeneration — prevents YouTube disconnect after hours
-      "-fflags", "+genpts+igndts",
       "-avoid_negative_ts", "make_zero",
 
       // Audio
@@ -64,22 +61,22 @@ function startFFmpeg(
       "-ar", "44100",
       "-ac", "2",
 
-      // Output
+      // Output — rate limit karo YouTube ke liye
+      "-maxrate", "2500k",    // ✅ Bandwidth cap — YouTube loves this
+      "-bufsize", "5000k",
       "-f", "flv",
       "-flvflags", "no_duration_filesize",
 
       rtmpUrl,
     ],
     {
-      detached: false, // ✅ NOT detached — we monitor this process
+      detached: false,
       stdio: ["ignore", "pipe", "pipe"],
     }
   );
 
-  // ✅ Drain stdout — warna 64KB buffer full hoga aur process freeze
   ffmpeg.stdout?.resume();
 
-  // Log stderr to file
   ensureLogDir().then(() => {
     const logPath = path.join(LOG_DIR, `${playlistId}.log`);
     const logStream = createWriteStream(logPath, { flags: "a" });
@@ -110,7 +107,6 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "playlistId and streamKey required" }, { status: 400 });
   }
 
-  // Kill existing process if any
   const existing = streamProcesses.get(playlistId);
   if (existing && !existing.killed) {
     existing.kill("SIGTERM");
@@ -132,13 +128,11 @@ export async function POST(req: NextRequest) {
 
   const rtmpUrl = `rtmp://a.rtmp.youtube.com/live2/${streamKey}`;
 
-  // ✅ Auto-restart on unexpected crash
   const onExit = async (code: number | null) => {
-    await new Promise((r) => setTimeout(r, 2000)); // brief delay
+    await new Promise((r) => setTimeout(r, 2000));
 
     const current = await prisma.streamConfig.findFirst({ where: { playlistId } });
 
-    // Sirf restart karo agar DB mein LIVE hai (user ne stop nahi kiya)
     if (current?.status !== "LIVE") {
       console.log(`[YT-Stream][${playlistId}] Status is ${current?.status} — skipping restart`);
       return;
@@ -147,7 +141,6 @@ export async function POST(req: NextRequest) {
     console.log(`[YT-Stream][${playlistId}] Unexpected exit (code=${code}) — restarting in 5s...`);
     await new Promise((r) => setTimeout(r, 5000));
 
-    // Fresh video list fetch karo
     const freshVideos = await prisma.video.findMany({
       where: { playlistId },
       orderBy: { order: "asc" },
