@@ -37,33 +37,34 @@ function startFFmpeg(
   const ffmpeg = spawn(
     "ffmpeg",
     [
-      // ✅ -re REMOVED — VFR videos ke saath hang karta tha
+      // INPUT — pehle framerate fix, phir input file
+      "-r", "30",               // Force 30fps INPUT pe — VFR hang fix
       "-fflags", "+genpts+igndts",
       "-f", "concat",
       "-safe", "0",
       "-i", concatPath,
 
-      // Video
+      // VIDEO ENCODING
       "-c:v", "libx264",
       "-preset", "ultrafast",
       "-crf", "23",
       "-pix_fmt", "yuv420p",
-      "-vsync", "cfr",        // ✅ Variable framerate fix
-      "-r", "30",             // ✅ Force constant 30fps — hang fix
+      "-r", "30",               // Force 30fps OUTPUT pe bhi
       "-g", "60",
       "-keyint_min", "60",
       "-sc_threshold", "0",
       "-avoid_negative_ts", "make_zero",
 
-      // Audio
+      // AUDIO
       "-c:a", "aac",
       "-b:a", "160k",
       "-ar", "44100",
       "-ac", "2",
 
-      // Output — rate limit karo YouTube ke liye
-      "-maxrate", "2500k",    // ✅ Bandwidth cap — YouTube loves this
+      // OUTPUT — real-time rate control
+      "-maxrate", "2500k",
       "-bufsize", "5000k",
+      "-re",                    // ✅ Output ke BAAD -re — real-time throttle sirf output pe
       "-f", "flv",
       "-flvflags", "no_duration_filesize",
 
@@ -145,6 +146,7 @@ export async function POST(req: NextRequest) {
       where: { playlistId },
       orderBy: { order: "asc" },
     });
+
     if (!freshVideos.length) {
       await prisma.streamConfig.update({
         where: { playlistId },
