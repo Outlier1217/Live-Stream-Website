@@ -1,11 +1,244 @@
 import { NextRequest, NextResponse } from "next/server";
 import { writeFile, mkdir } from "fs/promises";
-import { spawn, ChildProcess } from "child_process";
+import { execFile, spawn, ChildProcess } from "child_process";
 import { createWriteStream } from "fs";
 import path from "path";
+import { promisify } from "util";
 import prisma from "@/lib/prisma";
 
 const LOG_DIR = "/var/log/yt-streams";
+const execFileAsync = promisify(execFile);
+
+type StreamMode =
+  | { copy: true }
+  | { copy: false; reason: string };
+
+type ProbeStream = {
+  codec_type?: string;
+  codec_name?: string;
+  profile?: string;
+  level?: number;
+  width?: number;
+  height?: number;
+  pix_fmt?: string;
+  avg_frame_rate?: string;
+  r_frame_rate?: string;
+  time_base?: string;
+  codec_tag_string?: string;
+  sample_aspect_ratio?: string;
+  color_range?: string;
+  color_space?: string;
+  color_transfer?: string;
+  color_primaries?: string;
+  field_order?: string;
+  sample_rate?: string;
+  channels?: number;
+  channel_layout?: string;
+  extradata?: string;
+};
+
+type ProbeResult = {
+  streams?: ProbeStream[];
+  frames?: Array<{
+    key_frame?: number;
+    best_effort_timestamp_time?: string;
+    pkt_pts_time?: string;
+    pkt_dts_time?: string;
+  }>;
+  format?: { duration?: string; start_time?: string };
+};
+
+function parseRational(value: string | undefined): number | undefined {
+  if (!value) return undefined;
+  const match = /^(\d+)\/(\d+)$/.exec(value);
+  if (!match) return undefined;
+  const numerator = Number(match[1]);
+  const denominator = Number(match[2]);
+  if (!Number.isFinite(numerator) || denominator <= 0) return undefined;
+  return numerator / denominator;
+}
+
+function canonicalRational(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  const match = /^(\d+)\/(\d+)$/.exec(value);
+  if (!match) return undefined;
+  let numerator = Number(match[1]);
+  let denominator = Number(match[2]);
+  if (
+    !Number.isSafeInteger(numerator) || numerator <= 0 ||
+    !Number.isSafeInteger(denominator) || denominator <= 0
+  ) {
+    return undefined;
+  }
+  let left = numerator;
+  let right = denominator;
+  while (right !== 0) {
+    [left, right] = [right, left % right];
+  }
+  const divisor = left || 1;
+  numerator /= divisor;
+  denominator /= divisor;
+  return `${numerator}/${denominator}`;
+}
+
+async function runFFprobe(args: string[]): Promise<ProbeResult> {
+  const { stdout } = await execFileAsync("ffprobe", args, {
+    encoding: "utf8",
+    timeout: 60_000,
+    maxBuffer: 16 * 1024 * 1024,
+  });
+  return JSON.parse(stdout) as ProbeResult;
+}
+
+async function inspectVideo(filePath: string): Promise<string> {
+  const metadata = await runFFprobe([
+    "-v", "error",
+    "-show_streams",
+    "-show_format",
+    "-show_data",
+    "-of", "json",
+    filePath,
+  ]);
+  const streams = metadata.streams ?? [];
+  if (streams.length !== 2) {
+    throw new Error("expected exactly one video and one audio stream with no additional streams");
+  }
+
+  const videoStreams = streams.filter((stream) => stream.codec_type === "video");
+  const audioStreams = streams.filter((stream) => stream.codec_type === "audio");
+  if (videoStreams.length !== 1 || audioStreams.length !== 1) {
+    throw new Error("expected exactly one usable video stream and one usable audio stream");
+  }
+
+  const video = videoStreams[0];
+  const audio = audioStreams[0];
+  const avgFrameRate = parseRational(video.avg_frame_rate);
+  const nominalFrameRate = parseRational(video.r_frame_rate);
+  const videoTimeBase = canonicalRational(video.time_base);
+  const audioTimeBase = canonicalRational(audio.time_base);
+  const sampleRate = Number(audio.sample_rate);
+
+  if (
+    video.codec_name !== "h264" ||
+    !video.profile ||
+    typeof video.level !== "number" || !Number.isInteger(video.level) || video.level <= 0 ||
+    typeof video.width !== "number" || !Number.isInteger(video.width) || video.width <= 0 || video.width % 2 !== 0 ||
+    typeof video.height !== "number" || !Number.isInteger(video.height) || video.height <= 0 || video.height % 2 !== 0 ||
+    video.pix_fmt !== "yuv420p" ||
+    !avgFrameRate || !nominalFrameRate ||
+    avgFrameRate < 24 || avgFrameRate > 60 ||
+    avgFrameRate !== nominalFrameRate ||
+    !videoTimeBase || !audioTimeBase ||
+    !video.extradata || !audio.extradata ||
+    audio.codec_name !== "aac" ||
+    audio.profile !== "LC" ||
+    (sampleRate !== 44_100 && sampleRate !== 48_000) ||
+    audio.channels !== 2 ||
+    audio.channel_layout !== "stereo"
+  ) {
+    throw new Error("stream codec, profile, dimensions, pixel format, timing, or audio layout is unsupported");
+  }
+
+  const keyframes = await runFFprobe([
+    "-v", "error",
+    "-select_streams", "v:0",
+    "-skip_frame", "nokey",
+    "-show_frames",
+    "-show_entries", "frame=key_frame,best_effort_timestamp_time,pkt_pts_time,pkt_dts_time",
+    "-of", "json",
+    filePath,
+  ]);
+  const times = (keyframes.frames ?? [])
+    .filter((frame) => frame.key_frame === 1)
+    .map((frame) => Number(
+      frame.best_effort_timestamp_time ?? frame.pkt_pts_time ?? frame.pkt_dts_time
+    ))
+    .filter(Number.isFinite);
+  times.sort((left, right) => left - right);
+  const duration = Number(metadata.format?.duration);
+  const startTime = Number(metadata.format?.start_time);
+
+  if (
+    times.length < 3 ||
+    !Number.isFinite(duration) || duration <= 0 ||
+    !Number.isFinite(startTime)
+  ) {
+    throw new Error("keyframe interval could not be verified reliably");
+  }
+
+  const firstKeyframeOffset = times[0] - startTime;
+  const finalKeyframeGap = duration - (times[times.length - 1] - startTime);
+  if (
+    Math.abs(firstKeyframeOffset) > 0.2 ||
+    finalKeyframeGap < -0.2 ||
+    finalKeyframeGap > 2.2
+  ) {
+    throw new Error("keyframes do not cover the video with a suitable interval");
+  }
+
+  for (let index = 1; index < times.length; index += 1) {
+    const interval = times[index] - times[index - 1];
+    if (interval < 1.8 || interval > 2.2) {
+      throw new Error("keyframe interval is not approximately two seconds");
+    }
+  }
+
+  return JSON.stringify({
+    video: {
+      codec: video.codec_name,
+      profile: video.profile,
+      level: video.level,
+      width: video.width,
+      height: video.height,
+      pixelFormat: video.pix_fmt,
+      averageFrameRate: canonicalRational(video.avg_frame_rate),
+      nominalFrameRate: canonicalRational(video.r_frame_rate),
+      timeBase: videoTimeBase,
+      codecTag: video.codec_tag_string,
+      sampleAspectRatio: video.sample_aspect_ratio,
+      colorRange: video.color_range,
+      colorSpace: video.color_space,
+      colorTransfer: video.color_transfer,
+      colorPrimaries: video.color_primaries,
+      fieldOrder: video.field_order,
+      extradata: video.extradata,
+    },
+    audio: {
+      codec: audio.codec_name,
+      profile: audio.profile,
+      sampleRate,
+      channels: audio.channels,
+      channelLayout: audio.channel_layout,
+      timeBase: audioTimeBase,
+      codecTag: audio.codec_tag_string,
+      extradata: audio.extradata,
+    },
+  });
+}
+
+async function selectStreamMode(filePaths: string[]): Promise<StreamMode> {
+  let expectedSignature: string | undefined;
+  let failureReason: string | undefined;
+  for (const filePath of filePaths) {
+    try {
+      const signature = await inspectVideo(filePath);
+      if (!expectedSignature) {
+        expectedSignature = signature;
+      } else if (signature !== expectedSignature && !failureReason) {
+        failureReason = `incompatible stream parameters in ${filePath}`;
+      }
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : "unknown ffprobe error";
+      if (!failureReason) {
+        failureReason = `cannot safely copy ${filePath}: ${reason}`;
+      }
+    }
+  }
+  if (failureReason) return { copy: false, reason: failureReason };
+  return expectedSignature
+    ? { copy: true }
+    : { copy: false, reason: "playlist has no files to probe" };
+}
 
 // ─── Global process store ────────────────────────────────────────────────────
 declare global {
@@ -33,36 +266,38 @@ async function writeConcatFile(concatPath: string, filePaths: string[]) {
   await writeFile(concatPath, lines);
 }
 
-/**
- * FFmpeg ko spawn karta hai with transition-safe flags.
- *
- * Key changes from old code:
- * 1. `-stream_loop -1` — FFmpeg khud infinite loop karta hai concat list ko,
- *    timestamp discontinuity nahi hoti.
- * 2. `-vsync cfr` — Constant frame rate enforce karta hai across transitions.
- * 3. `-force_key_frames "expr:gte(t,n_forced*2)"` — Har 2 sec pe keyframe,
- *    YouTube ke liye healthy.
- * 4. `-max_muxing_queue_size 1024` — Video/audio queue mismatch se crash nahi hoga.
- * 5. `-reconnect 1 -reconnect_at_eof 1` — Agar RTMP drop ho toh auto reconnect.
- * 6. `-timeout 30000000` — Network timeout 30s (microseconds).
- */
+/** Spawn FFmpeg with the selected, prevalidated playlist mode. */
 function startFFmpeg(
   playlistId: string,
   concatPath: string,
   rtmpUrl: string,
+  mode: StreamMode,
   onExit: (code: number | null) => void
 ): ChildProcess {
-  const ffmpeg = spawn(
-    "ffmpeg",
-    [
-      // ── INPUT ──────────────────────────────────────────────────────────────
-      "-re",                          // Real-time speed mein read karo
-      "-stream_loop", "-1",          // ✅ Infinite loop — concat list ko khud repeat karega
-      "-fflags", "+genpts",          // ✅ Sirf genpts — igndts hata diya (wahi stuck karta tha)
-      "-f", "concat",
-      "-safe", "0",
-      "-i", concatPath,
+  console.log(mode.copy
+    ? `[YT-Stream][${playlistId}] COPY MODE selected`
+    : `[YT-Stream][${playlistId}] TRANSCODE MODE selected: ${mode.reason}`);
 
+  const args = [
+    // ── INPUT ──────────────────────────────────────────────────────────────
+    "-re",                          // Real-time speed mein read karo
+    "-stream_loop", "-1",          // ✅ Infinite loop — concat list ko khud repeat karega
+    "-fflags", "+genpts",          // ✅ Sirf genpts — igndts hata diya (wahi stuck karta tha)
+    "-f", "concat",
+    "-safe", "0",
+    "-i", concatPath,
+  ];
+
+  if (mode.copy) {
+    args.push(
+      "-map", "0:v:0",
+      "-map", "0:a:0",
+      "-c:v", "copy",
+      "-c:a", "copy",
+      "-max_muxing_queue_size", "1024"
+    );
+  } else {
+    args.push(
       // ── VIDEO ENCODING ────────────────────────────────────────────────────
       "-c:v", "libx264",
       "-preset", "veryfast",         // ultrafast se veryfast — better quality, manageable CPU
@@ -76,28 +311,31 @@ function startFFmpeg(
       "-vsync", "cfr",               // ✅ Constant frame rate — transition pe stutter nahi
       "-max_muxing_queue_size", "1024", // ✅ Audio/video queue overflow fix
 
-      // ── AUDIO ENCODING ────────────────────────────────────────────────────
+      // ── AUDIO ENCODING ───────────────────────────────────────────────────
       "-c:a", "aac",
       "-b:a", "160k",
       "-ar", "44100",
       "-ac", "2",
 
-      // ── BITRATE CONTROL ───────────────────────────────────────────────────
+      // ── BITRATE CONTROL ──────────────────────────────────────────────────
       "-maxrate", "2500k",
-      "-bufsize", "5000k",
+      "-bufsize", "5000k"
+    );
+  }
 
-      // ── OUTPUT / RTMP ─────────────────────────────────────────────────────
-      "-f", "flv",
-      "-flvflags", "no_duration_filesize",
-      "-reconnect", "1",             // ✅ RTMP drop pe reconnect try karo
-      "-reconnect_at_eof", "1",      // ✅ EOF pe bhi reconnect
-      rtmpUrl,
-    ],
-    {
-      detached: false,
-      stdio: ["ignore", "pipe", "pipe"],
-    }
+  args.push(
+    // ── OUTPUT / RTMP ───────────────────────────────────────────────────────
+    "-f", "flv",
+    "-flvflags", "no_duration_filesize",
+    "-reconnect", "1",             // ✅ RTMP drop pe reconnect try karo
+    "-reconnect_at_eof", "1",      // ✅ EOF pe bhi reconnect
+    rtmpUrl
   );
+
+  const ffmpeg = spawn("ffmpeg", args, {
+    detached: false,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
 
   ffmpeg.stdout?.resume();
 
@@ -111,15 +349,19 @@ function startFFmpeg(
 
   ffmpeg.on("exit", (code, signal) => {
     console.log(`[YT-Stream][${playlistId}] FFmpeg exited — code=${code} signal=${signal}`);
-    streamProcesses.delete(playlistId);
-    stopHealthMonitor(playlistId);
+    if (streamProcesses.get(playlistId) === ffmpeg) {
+      streamProcesses.delete(playlistId);
+      stopHealthMonitor(playlistId);
+    }
     onExit(code);
   });
 
   ffmpeg.on("error", (err) => {
     console.error(`[YT-Stream][${playlistId}] Spawn error:`, err.message);
-    streamProcesses.delete(playlistId);
-    stopHealthMonitor(playlistId);
+    if (streamProcesses.get(playlistId) === ffmpeg) {
+      streamProcesses.delete(playlistId);
+      stopHealthMonitor(playlistId);
+    }
     onExit(-1);
   });
 
@@ -142,8 +384,10 @@ function startHealthMonitor(
   onExit: (code: number | null) => void
 ) {
   stopHealthMonitor(playlistId); // Pehla clear karo agar tha
+  let restarting = false;
 
   const interval = setInterval(async () => {
+    if (restarting) return;
     const proc = streamProcesses.get(playlistId);
 
     // Check DB status
@@ -156,13 +400,39 @@ function startHealthMonitor(
     if (!proc || proc.killed || proc.exitCode !== null) {
       // Process dead hai but DB LIVE hai — restart!
       console.log(`[HealthMonitor][${playlistId}] Process dead, DB says LIVE — restarting...`);
-      const newProc = startFFmpeg(playlistId, concatPath, rtmpUrl, onExit);
-      streamProcesses.set(playlistId, newProc);
-      startHealthMonitor(playlistId, concatPath, rtmpUrl, onExit);
-      await prisma.streamConfig.update({
-        where: { id: config.id },
-        data: { pid: newProc.pid },
-      });
+      if (streamProcesses.get(playlistId) !== proc) return;
+      restarting = true;
+      try {
+        const freshVideos = await prisma.video.findMany({
+          where: { playlistId },
+          orderBy: { order: "asc" },
+        });
+        if (!freshVideos.length) {
+          stopHealthMonitor(playlistId);
+          await prisma.streamConfig.update({
+            where: { id: config.id },
+            data: { status: "OFFLINE", pid: null },
+          });
+          return;
+        }
+
+        const filePaths = freshVideos.map((video) => video.filePath);
+        await writeConcatFile(concatPath, filePaths);
+        const mode = await selectStreamMode(filePaths);
+        if (streamProcesses.get(playlistId) !== proc) return;
+
+        const newProc = startFFmpeg(playlistId, concatPath, rtmpUrl, mode, onExit);
+        streamProcesses.set(playlistId, newProc);
+        startHealthMonitor(playlistId, concatPath, rtmpUrl, onExit);
+        await prisma.streamConfig.update({
+          where: { id: config.id },
+          data: { pid: newProc.pid },
+        });
+      } catch (error) {
+        console.error(`[HealthMonitor][${playlistId}] Restart failed:`, error);
+      } finally {
+        restarting = false;
+      }
     }
     // Process alive hai — all good
   }, 60_000); // Har 60 second
@@ -205,7 +475,21 @@ export async function POST(req: NextRequest) {
   }
 
   const concatPath = `/tmp/${playlistId}-concat.txt`;
-  await writeConcatFile(concatPath, videos.map((v) => v.filePath));
+  const filePaths = videos.map((video) => video.filePath);
+  await writeConcatFile(concatPath, filePaths);
+  const mode = await selectStreamMode(filePaths);
+
+  const processStartedDuringProbe = streamProcesses.get(playlistId);
+  if (processStartedDuringProbe) {
+    stopHealthMonitor(playlistId);
+    if (!processStartedDuringProbe.killed && processStartedDuringProbe.exitCode === null) {
+      processStartedDuringProbe.kill("SIGTERM");
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+    }
+    if (streamProcesses.get(playlistId) === processStartedDuringProbe) {
+      streamProcesses.delete(playlistId);
+    }
+  }
 
   const rtmpUrl = `rtmp://a.rtmp.youtube.com/live2/${streamKey}`;
 
@@ -216,6 +500,12 @@ export async function POST(req: NextRequest) {
     const current = await prisma.streamConfig.findFirst({ where: { playlistId } });
     if (current?.status !== "LIVE") {
       console.log(`[YT-Stream][${playlistId}] Manual stop detected — no restart`);
+      return;
+    }
+
+    const activeProcess = streamProcesses.get(playlistId);
+    if (activeProcess && !activeProcess.killed && activeProcess.exitCode === null) {
+      console.log(`[YT-Stream][${playlistId}] Restart already active — skipping duplicate`);
       return;
     }
 
@@ -235,9 +525,17 @@ export async function POST(req: NextRequest) {
       return;
     }
 
-    await writeConcatFile(concatPath, freshVideos.map((v) => v.filePath));
+    const freshFilePaths = freshVideos.map((video) => video.filePath);
+    await writeConcatFile(concatPath, freshFilePaths);
+    const freshMode = await selectStreamMode(freshFilePaths);
 
-    const newProc = startFFmpeg(playlistId, concatPath, rtmpUrl, onExit);
+    const currentProcess = streamProcesses.get(playlistId);
+    if (currentProcess && !currentProcess.killed && currentProcess.exitCode === null) {
+      console.log(`[YT-Stream][${playlistId}] Restart already active — skipping duplicate`);
+      return;
+    }
+
+    const newProc = startFFmpeg(playlistId, concatPath, rtmpUrl, freshMode, onExit);
     streamProcesses.set(playlistId, newProc);
     startHealthMonitor(playlistId, concatPath, rtmpUrl, onExit);
 
@@ -250,7 +548,7 @@ export async function POST(req: NextRequest) {
   };
 
   // ── Start ─────────────────────────────────────────────────────────────────
-  const ffmpeg = startFFmpeg(playlistId, concatPath, rtmpUrl, onExit);
+  const ffmpeg = startFFmpeg(playlistId, concatPath, rtmpUrl, mode, onExit);
   streamProcesses.set(playlistId, ffmpeg);
   startHealthMonitor(playlistId, concatPath, rtmpUrl, onExit);
 
